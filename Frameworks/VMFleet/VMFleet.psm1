@@ -1279,10 +1279,14 @@ $CommonFunc = {
     }
 
     # Initializing archci configs and retrieving extended location required for resource creation using az cli 
-    function InitializeAndGetArcHCIExtendedLoc() {
+    function InitializeAndGetArcHCIExtendedLoc($azuser, $azpassword) {
         az config set extension.use_dynamic_install=yes_without_prompt core.encrypt_token_cache=false core.disable_confirm_prompt=true core.only_show_errors=true;
         set-alias -name az -value 'C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd';
         $subscription = ((Get-AzureStackHCI | select AzureResourceUri).AzureResourceUri).Split("/")[2]
+        $isLoggedIn = az login -u $azuser -p $azpassword
+        if($isLoggedIn -eq $null){
+           throw "az login failed with error - $isLoggedIn"
+        }
         az account set -s $subscription
         $cl = ((Get-AzureStackHci).AzureResourceName) + "-mocarb" + "-CL"
         $rbResourceGroup = ((Get-AzureStackHCI | select AzureResourceUri).AzureResourceUri).Split("/")[4]
@@ -2293,8 +2297,21 @@ function New-Fleet
 
         [Parameter(ParameterSetName = "ByCluster")]
         [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
         [string]
-        $ResourceGroupForArcVM = 'VMFleetArcVMRG'
+        $ResourceGroupForArcVM = 'VMFleetArcVMRG',
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $AzureRegistrationUser,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $AzureRegistrationPassword
     )
 
     # Parameter set specifying cluster only
@@ -2409,41 +2426,60 @@ function New-Fleet
     # Create Gallery Image and Storage Path Arc resource
     if ($CreateArcVMs) {
         LogOutput "Flag on for Arc VM Creation"
-        Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroupForArcVM,$BaseVHD)  -ScriptBlock {  
-            param($resourceGroup, $vhdPath)
-            $spCreated = $false
-            $imgCreated = $false
-            $extendedLocation = InitializeAndGetArcHCIExtendedLoc
-            if ($extendedLocation -eq $null) {
-                LogOutput -ForegroundColor Red "Error generating Extended Location value - $extendedLocation"
-                return
-            }
-            $availableCSVs = GetAvailableCSVs
-            if ($availableCSVs -eq $null -or $availableCSVs.Count -eq 0) {
-                LogOutput -ForegroundColor Red "No CSVs available to store gallery image."
-                return
-            }
+        $result =  Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroupForArcVM,$BaseVHD, $AzureRegistrationUser, $AzureRegistrationPassword)  -ScriptBlock {  
+            param($resourceGroup, $vhdPath, $azuser, $azpassword)
+            $azRetry = $true
+            $retryCount = 0
+            while($azRetry -and $retryCount -lt 3){
+                try{
+                    $spCreated = $false
+                    $imgCreated = $false
+                    $extendedLocation = InitializeAndGetArcHCIExtendedLoc $azuser $azpassword
+                    if ($extendedLocation -eq $null) {
+                        LogOutput -ForegroundColor Red "Error generating Extended Location value - $extendedLocation"
+                        return "Error occurred while getting extended location"
+                    }
+                    $availableCSVs = GetAvailableCSVs
+                    if ($availableCSVs -eq $null -or $availableCSVs.Count -eq 0) {
+                        LogOutput -ForegroundColor Red "No CSVs available to store gallery image."
+                        return "Error occurred while getting CSVs"
+                    }
 
-            LogOutput "Creating storage path $using:storagePathName..."
-            $csv = $availableCSVs[0].FriendlyVolumeName
-            $location = (Get-AzureStackHCI | select Region).Region
-            $spResult = (az stack-hci-vm storagepath create --name $using:storagePathName --resource-group $resourceGroup --custom-location $extendedLocation --path $csv --location $location) | ConvertFrom-Json
-            if ($spResult.properties.provisioningState -eq "Succeeded") {
-               LogOutput "Storage path $using:storagePathName created successfully, creating image with $vhdPath..."
-                $spCreated = $true
-                # currently, only windows image is supported
-                $imgResult = az stack-hci-vm image create --name $using:imageName --resource-group $resourceGroup --location $location --custom-location $extendedLocation --os-type Windows --storage-path-id $spResult.id --image-path $vhdPath | ConvertFrom-Json
-                if ($imgResult.properties.provisioningState -eq "Succeeded") {
-                    $imgCreated = $true
-                    LogOutput "Image $using:imageName created successfully"
-                    LogOutput -ForegroundColor Green "Finished creating resources using az cli"
-                    Start-Sleep -Seconds 300
-                }     
-            }   
-            if (-not $spCreated -or -not $imgCreated) {
-                LogOutput -ForegroundColor Red "Error occurred while creating storage path and image. Please check logs."
-                return
-            }  
+                    LogOutput "Creating storage path $using:storagePathName..."
+                    $csv = $availableCSVs[0].FriendlyVolumeName
+                    $location = (Get-AzureStackHCI | select Region).Region
+
+
+                    $spResult = (az stack-hci-vm storagepath create --name $using:storagePathName --resource-group $resourceGroup --custom-location $extendedLocation --path $csv --location $location) | ConvertFrom-Json
+                    if ($spResult.properties.provisioningState -eq "Succeeded") {
+                        LogOutput "Storage path $using:storagePathName created successfully, creating image with $vhdPath..."
+                        $spCreated = $true
+                        # currently, only windows image is supported
+                        $imgResult = az stack-hci-vm image create --name $using:imageName --resource-group $resourceGroup --location $location --custom-location $extendedLocation --os-type Windows --storage-path-id $spResult.id --image-path $vhdPath | ConvertFrom-Json
+                        if ($imgResult.properties.provisioningState -eq "Succeeded") {
+                             $imgCreated = $true
+                             LogOutput "Image $using:imageName created successfully"
+                             LogOutput -ForegroundColor Green "Finished creating resources using az cli"
+                             Start-Sleep -Seconds 300
+                             $azRetry = $false
+                        }     
+                    }   
+                   if (-not $spCreated -or -not $imgCreated) {
+                       LogOutput -ForegroundColor Red "Error occurred while creating storage path and image. Please check logs."
+                       throw "Error occurred while creating az resources for retry count - $retryCount"
+                   }
+                }
+                catch {
+                   $retryCount = $retryCount+1
+                   if($retryCount -eq 3){
+                        return "Error occurred while creating az resources for all retry counts"                        
+                   }
+                }
+            }
+        }
+
+        if($result -contains "Error"){
+            return
         }
     }
     #### STOPAFTER
@@ -2461,9 +2497,9 @@ function New-Fleet
         FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
     }}
 
-    Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ArgumentList @(, $csvs, $CreateArcVMs, $ResourceGroupForArcVM) -ScriptBlock {
+    Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ArgumentList @(, $csvs, $CreateArcVMs, $ResourceGroupForArcVM, $AzureRegistrationUser, $AzureRegistrationPassword) -ScriptBlock {
 
-        param($csvs, $createArcVMs, $resourceGroup)
+        param($csvs, $createArcVMs, $resourceGroup, $azuser, $azpassword)
         foreach ($csv in $csvs) {
             if ($($using:groups).Length -eq 0) {
                 $groups = @( 'base' )
@@ -2566,44 +2602,64 @@ function New-Fleet
                                 }
                             }
                             else {
-                                    $extendedLocation = InitializeAndGetArcHCIExtendedLoc
-                                    $location = (Get-AzureStackHCI | select Region).Region
-                                    $computerName = -join ((65..90) + (97..122) | Get-Random -Count 5 | % { [char]$_ })
-                                    LogOutput "Start executing az cli vm create cmd for $name"
-                                    $vmResult = az stack-hci-vm create --name $name --resource-group $resourceGroup --admin-username $using:admin --admin-password $using:adminpass --computer-name $computerName --location $location --enable-agent False --custom-location $extendedLocation --image $using:imageName --storage-path-id  $using:storagePathName
-                                    $vmResult
-                                    # hyper v arc vm names
-                                    $vmname = "Virtual Machine " + $name
-                                    $Stoploop = $false
+                                    $azRetry = $true
                                     [int]$Retrycount = "0"
-                                    
-                                    do {
-                                        try {
-                                            LogOutput "Executing Get-ClusterResource -Name $vmname | Get-VM"
-                                            $o = Get-ClusterResource -Name $vmname
-                                            $ownerNode = Get-ClusterResource -Name $vmname | Select-Object OwnerNode
-                                            if ($o -eq $null) {
-                                                throw "Null returned by Get-ClusterResource due to some error"
-                                            }
-                                            else {
-                                               LogOutput "Creation of vm completed at hyper-v level"
-                                                $Stoploop = $true
-                                            }
+                                    while($azRetry -and $Retrycount -lt 3){
+                                        try{
+                                             $vmResult = $null
+                                             $extendedLocation = InitializeAndGetArcHCIExtendedLoc $azuser $azpassword
+                                             $location = (Get-AzureStackHCI | select Region).Region
+                                             $computerName = -join ((65..90) + (97..122) | Get-Random -Count 5 | % { [char]$_ })
+                                             LogOutput "Start executing az cli vm create cmd for $name"
+                                             $vmResult = az stack-hci-vm create --name $name --resource-group $resourceGroup --admin-username $using:admin --admin-password $using:adminpass --computer-name $computerName --location $location --enable-agent False --custom-location $extendedLocation --image $using:imageName --storage-path-id  $using:storagePathName
+                                             $vmResult
+                                             if(vmResult -eq $null){
+                                                 throw "Error creating Virtual machine $name on retry count $retryCount"
+                                             }
+                                             $azRetry = $false
                                         }
                                         catch {
-                                            if ($Retrycount -gt 20) {
-                                                LogOutput "Could not get VM $vmname after 20 retries using Get-ClusterResource"
-                                                $Stoploop = $true
-                                            }
-                                            else {
-                                                Write-Host "Could not get VM $vmname at $RetryCount retry count. Retrying in 6 minutes..."
-                                                LogOutput "Starting with some sleep time"
-                                                Start-Sleep -Seconds 360
-                                                $Retrycount = $Retrycount + 1
-                                            }
+                                           $Retrycount = $Retrycount+1
+                                           if($Retrycount -eq 3){
+                                                LogOutput -ForegroundColor Red "Error occurred while creating az resources for all retry counts"
+                                                $stop = $true
+                                                $azRetry = $false
+                                           }
                                         }
                                     }
-                                    While ($Stoploop -eq $false)                                                           
+                                    if (-not $stop) {
+                                        # hyper v arc vm names
+                                        $vmname = "Virtual Machine " + $name
+                                        $Stoploop = $false
+                                        [int]$Retrycount = "0"
+                                        do {
+                                            try {
+                                                LogOutput "Executing Get-ClusterResource -Name $vmname | Get-VM"
+                                                $o = Get-ClusterResource -Name $vmname
+                                                $ownerNode = Get-ClusterResource -Name $vmname | Select-Object OwnerNode
+                                                if ($o -eq $null) {
+                                                    throw "Null returned by Get-ClusterResource due to some error"
+                                                }
+                                                else {
+                                                   LogOutput "Creation of vm completed at hyper-v level"
+                                                    $Stoploop = $true
+                                                }
+                                            }
+                                            catch {
+                                                if ($Retrycount -gt 20) {
+                                                    LogOutput "Could not get VM $vmname after 20 retries using Get-ClusterResource"
+                                                    $Stoploop = $true
+                                                }
+                                                else {
+                                                    Write-Host "Could not get VM $vmname at $RetryCount retry count. Retrying in 6 minutes..."
+                                                    LogOutput "Starting with some sleep time"
+                                                    Start-Sleep -Seconds 360
+                                                    $Retrycount = $Retrycount + 1
+                                                }
+                                            }
+                                        }
+                                        While ($Stoploop -eq $false)      
+                                    }
                             }
                             #### STOPAFTER
                             if (-not $stop) {
@@ -2690,6 +2746,118 @@ function Specialize-ArcVMs ($admin ,$adminpass, $connectuser, $connectpass){
         }
         else { LogOutput -ForegroundColor green "Successfully Specialized $name" }
     }
+}
+function Remove-ArcVMFleet{
+  [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]
+        $Cluster = ".",
+
+        [Parameter()]
+        [string[]]
+        $VMs,
+
+        [Parameter()]
+        [string]
+        $ResourceGroup
+    )
+    # Parameter set specifying cluster only
+    $clusterParam = @{}
+    CopyKeyIf $PSBoundParameters $clusterParam 'Cluster'
+
+    if ($vms)
+    {
+        LogOutput -IsVb "Removing VM Fleet content for: $vms"
+    }
+    else
+    {
+        LogOutput -IsVb "Removing VM Fleet"
+    }
+
+    # stop and remove clustered vm roles
+    Get-ClusterGroup @clusterParam |? GroupType -eq VirtualMachine |? {
+
+        if ($vms)
+        {
+            $_.Name -in $vms
+        }
+        else
+        {
+            $_.Name -like 'vm-*'
+        }
+    } |% {
+
+        LogOutput -IsVb "Removing ClusterGroup for $($_.Name)"
+        $null = $_ | Stop-ClusterGroup
+        $_ | Remove-ClusterGroup -RemoveResources -Force
+    }
+
+    # Capture flag file path for the installation
+    $flagPath = Get-FleetPath -PathType Flag @clusterParam
+
+    # remove all vms
+    Invoke-CommonCommand (Get-ClusterNode @clusterParam) -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroup) -ScriptBlock {
+
+                    [CmdletBinding()]
+                    param(
+                        [string]
+                        $resourceGroup
+                    )
+        Get-VM |? {
+            if ($using:vms)
+            {
+                $_.Name -in $using:vms
+            }
+            else
+            {
+                $_.Name -like 'vm-*'
+            }
+        } |% {
+            $vmName = $_.Name
+            LogOutput "Removing VM for $($_.Name) @ $($env:COMPUTERNAME)"
+           
+            if(az stack-hci-vm delete --name $vmName --resource-group $resourceGroup --yes) {
+                LogOutput "Removed $vmName"
+            }
+            else {
+                LogOutput "Error removing $vmName"
+            }
+        }
+    if ($null -eq $vms)
+        {
+             $switch = Get-VMSwitch -SwitchType Internal
+            if ($null -ne $switch)
+            {
+                LogOutput "Removing Internal VMSwitch @ $($env:COMPUTERNAME)"
+                $switch | Remove-VMSwitch -Confirm:$False -Force
+            }
+        }
+    }
+    if ($null -eq $vms)
+        {
+        $nodes = Get-ClusterNode @clusterParam
+        Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroup) -ScriptBlock {
+
+                    [CmdletBinding()]
+                    param(
+                        [string]
+                        $resourceGroup
+                    )
+            $sp = az stack-hci-vm storagepath show --name $using:storagePathName --resource-group $resourceGroup | ConvertFrom-Json
+            $image = az stack-hci-vm image show --name $using:imageName --resource-group $resourceGroup | ConvertFrom-Json
+            if($image -ne $null){
+                 LogOutput "Deleting image"
+            az stack-hci-vm image delete --name $using:imageName --resource-group $resourceGroup --yes
+            LogOutput "Deleted image"
+            }
+            if($sp -ne $null){
+                LogOutput "Deleting Storage Path"
+            az stack-hci-vm storagepath delete --name $using:storagePathName --resource-group $resourceGroup --yes
+            }
+        }
+    }
+    LogOutput "Remove-Fleet completed for all nodes"
 }
 
 function Remove-Fleet
@@ -5051,7 +5219,7 @@ function GetDoneFlags
 
         [Parameter()]
         [double]
-        $Timeout = 120,
+        $Timeout = 1800,
 
         [Parameter()]
         [switch]

@@ -139,7 +139,8 @@ FunctionsToExport = @(
     'Use-FleetPolynomialFit',
     'Watch-FleetCluster',
     'Watch-FleetCPU',
-    'Specialize-ArcVMs'
+    'Specialize-ArcVMs',
+    'Remove-ArcVMFleet'
 )
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
