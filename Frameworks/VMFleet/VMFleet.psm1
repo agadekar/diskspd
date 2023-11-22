@@ -2626,7 +2626,7 @@ function New-Fleet
                                              $location = (Get-AzureStackHCI | select Region).Region
                                              $computerName = -join ((65..90) + (97..122) | Get-Random -Count 5 | % { [char]$_ })
                                              LogOutput "Start executing az cli vm create cmd for $name"
-                                             $vmResult = az stack-hci-vm create --name $name --resource-group $resourceGroup --admin-username $using:admin --admin-password $using:adminpass --computer-name $computerName --location $location --enable-agent False --custom-location $extendedLocation --image $using:imageName --storage-path-id  $using:storagePathName
+                                             $vmResult = az stack-hci-vm create --name $name --resource-group $resourceGroup --admin-username $using:admin --admin-password $using:adminpass --computer-name $computerName --location $location --enable-agent False --enable-vm-config-agent false --os-type "Windows" --custom-location $extendedLocation --image $using:imageName --storage-path-id  $using:storagePathName
                                              LogOutput "Result returned for $name - $vmResult"
                                              if($vmResult -eq $null){
                                                  $msg = "Error creating Virtual machine $name on retry count $retryCount"
