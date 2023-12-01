@@ -87,8 +87,9 @@ class VolumeEstimate
 $vmSwitchName = 'FleetInternal'
 $vmSwitchIP = '169.254.1.1'
 #Note: These constants are required for Arc VM 
-$storagePathName = "vmfleetStoragePath"
-$imageName = "vmfleetImage"
+$randomString = -join ((0x30..0x39) + ( 0x41..0x5A) + ( 0x61..0x7A) | Get-Random -Count 4  | % { [char]$_ })
+$storagePathName = "vmfleetStoragePath$randomString"
+$imageName = "vmfleetImage$randomString"
 
 
 # Note: this can be directly determined by Get-SmbClientConfiguration. Changes are not expected, but
@@ -2851,12 +2852,8 @@ function Remove-ArcVMFleet{
             $vmName = $_.Name
             LogOutput "Removing VM for $($_.Name) @ $($env:COMPUTERNAME)"
            
-            if(az stack-hci-vm delete --name $vmName --resource-group $resourceGroup --yes) {
-                LogOutput "Removed $vmName"
-            }
-            else {
-                LogOutput "Error removing $vmName"
-            }
+            $result = az stack-hci-vm delete --name $vmName --resource-group $resourceGroup --yes
+            LogOutput "Result returned for removing $vmName - $result"
         }
     if ($null -eq $vms)
         {
