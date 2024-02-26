@@ -1309,12 +1309,6 @@ $CommonFunc = {
         return $extendedLocation
     }
 
-    # ArcHCI cluster always contain CSVs with "UserStorage" string which are used to store resource files like VM VHDs, generate storage paths etc
-    function GetAvailableCSVs() {
-        $availableCSVs = Get-ClusterSharedVolume | ? Name -like "*UserStorage*" | Select -ExpandProperty SharedVolumeInfo | Select FriendlyVolumeName
-        return $availableCSVs
-    }
-
     function ApplySpecialization( $path, $vmspec, $admin, $adminPass, $connectUser, $connectPass ) {
         # all steps here can fail immediately without cleanup
 
@@ -2327,7 +2321,13 @@ function New-Fleet
         [Parameter(ParameterSetName = "ByNode")]
         [ValidateNotNullOrEmpty()]
         [string]
-        $AzureRegistrationPassword
+        $AzureRegistrationPassword,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $StoragePathCsv
     )
 
     # Parameter set specifying cluster only
@@ -2438,10 +2438,30 @@ function New-Fleet
         }
     }
 
+    # create $vms vms per each csv named as <nodename><group prefix>
+    # vm name is vm-<group prefix><$group>-<hostname>-<number>
+
+    # note that this would pass as a shallow copy of the object; this is why they are unpacked
+    # into a (flat) custom object
+    $csvs = GetMappedCSV @clusterParam |% { [PSCustomObject]@{
+        VDName = $_.VDName
+        FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
+    }}
+
     # Create Gallery Image and Storage Path Arc resources if Arc VM flag set to true
     if ($CreateArcVMs) {
-        $result =  Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroupForArcVM,$BaseVHD, $AzureRegistrationUser, $AzureRegistrationPassword)  -ScriptBlock {  
-            param($resourceGroup, $vhdPath, $azUser, $azPassword)
+        if(-not $PSBoundParameters.ContainsKey("StoragePathCsv")){
+            foreach ($csv in $csvs) {
+                # identify the Csv which can be used to create storage path
+                # the trailing characters (if any) are the group prefix
+                if ($csv.VDName -match "^$env:COMPUTERNAME(?:-.+){0,1}") {
+                    $StoragePathCsv = $csv.FriendlyVolumeName
+                    break
+                }
+            }
+        }
+        $result =  Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @($ResourceGroupForArcVM,$BaseVHD, $AzureRegistrationUser, $AzureRegistrationPassword, $StoragePathCsv)  -ScriptBlock {  
+            param($resourceGroup, $vhdPath, $azUser, $azPassword, $storagePathCsv)
             $azRetry = $true
             $retryCount = 0
             while($azRetry -and $retryCount -lt 3){
@@ -2453,16 +2473,10 @@ function New-Fleet
                         LogOutput -ForegroundColor Red "Error generating Extended Location value - $extendedLocation"
                         return "Error occurred while getting extended location"
                     }
-                    $availableCSVs = GetAvailableCSVs
-                    if ($availableCSVs -eq $null -or $availableCSVs.Count -eq 0) {
-                        LogOutput -ForegroundColor Red "No CSVs available to store gallery image."
-                        return "Error occurred while getting CSVs"
-                    }
 
                     LogOutput "Creating storage path $using:storagePathName..."
-                    $csv = $availableCSVs[0].FriendlyVolumeName
                     $location = (Get-AzureStackHCI | select Region).Region
-                    $spResult = (az stack-hci-vm storagepath create --name $using:storagePathName --resource-group $resourceGroup --custom-location $extendedLocation --path $csv --location $location) | ConvertFrom-Json
+                    $spResult = (az stack-hci-vm storagepath create --name $using:storagePathName --resource-group $resourceGroup --custom-location $extendedLocation --path $storagePathCsv --location $location) | ConvertFrom-Json
                     if ($spResult.properties.provisioningState -eq "Succeeded") {
                         LogOutput "Storage path $using:storagePathName created successfully, creating image with $vhdPath..."
                         $spCreated = $true
@@ -2499,16 +2513,6 @@ function New-Fleet
     if (Stop-After "CreateVMSwitch" $stopafter) {
         return
     }
-
-    # create $vms vms per each csv named as <nodename><group prefix>
-    # vm name is vm-<group prefix><$group>-<hostname>-<number>
-
-    # note that this would pass as a shallow copy of the object; this is why they are unpacked
-    # into a (flat) custom object
-    $csvs = GetMappedCSV @clusterParam |% { [PSCustomObject]@{
-        VDName = $_.VDName
-        FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
-    }}
 
     Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ArgumentList @($csvs, $CreateArcVMs, $ResourceGroupForArcVM, $AzureRegistrationUser, $AzureRegistrationPassword) -ScriptBlock {
 
@@ -2740,7 +2744,10 @@ function Specialize-ArcVMs ($admin ,$adminpass, $connectuser, $connectpass){
         $name = $vm.Name
         $vhdPath = $null
         # finds os disk for each vm
-        foreach ($csv in GetAvailableCSVs) {
+        $csvs = GetMappedCSV $clusterName |% { [PSCustomObject]@{
+            FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
+        }}
+        foreach ($csv in $csvs) {
             $csvpath = $csv.FriendlyVolumeName
             $filepath = "C:\$name.txt"
             Get-ChildItem -Path $csvpath -recurse -Filter *$name*OSDisk*.vhdx | Select -ExpandProperty Fullname | Out-File $filepath

@@ -1,6 +1,6 @@
 # From Setup to Start-FleetSweep
 
-This is the traditional path of setting up VMFleet and running it using your desired DiskSpd parameters/flags.
+This is the traditional path of setting up VMFleet to deploy Arc enabled VMs on HCI clusters and running it using your desired DiskSpd parameters/flags.
 
  
 
@@ -106,7 +106,7 @@ Set-ClusterStorageSpacesDirect -CacheState Disabled;
     We will now create our “fleet” of VMs by running:
     
 ```
-New-Fleet -basevhd <PATH TO VHDX> -vms [ENTER_NUM_VMS] -adminpass [ENTER_ADMINPASS] -connectuser [ENTER_NODE_USER] -connectpass [ENTER_NODE_PASS] -createArcVMs -resourceGroupForArcVM [ENTER_RESOURCE_GROUP] -azureRegistrationUser [ENTER_AZURE_REGUSER] -azureRegistrationPassword [ENTER_AZURE_REGPASS]
+New-Fleet -basevhd <PATH TO VHDX> -vms [ENTER_NUM_VMS] -adminpass [ENTER_ADMINPASS] -connectuser [ENTER_NODE_USER] -connectpass [ENTER_NODE_PASS] -createArcVMs -resourceGroupForArcVM [ENTER_RESOURCE_GROUP] -azureRegistrationUser [ENTER_AZURE_REGUSER] -azureRegistrationPassword [ENTER_AZURE_REGPASS] -storagePathCsv [ENTER_CSV_PATH]
 ``` 
 
     -"adminpass" is the administrator password for the Server Core Image. This is the password you set on your Virtual Machine earlier.
@@ -123,12 +123,14 @@ New-Fleet -basevhd <PATH TO VHDX> -vms [ENTER_NUM_VMS] -adminpass [ENTER_ADMINPA
 
     -"azureRegistrationUser" and "azureRegistrationPassword" are the azure account credentials.
 
+    -"storagePathCsv" is the csv path where storage path resource will be created. If not provided, one of the existing csvs which were created earlier will be used by default.
+
 5. If this parameter is not provided, the default is a 1:1 subscription ratio where the Number of VMs = Number of physical cores.
 
 [Optional] You can consider modifying the VM hardware configuration. Run
  
 ```
-Set-Fleet -ProcessorCount 1 -MemoryStartupBytes 2048 -MemoryMaximumBytes 2048 -MemoryMinimumBytes 2048
+Set-Fleet -ProcessorCount 1 -MemoryStartupBytes 2048 -MemoryMaximumBytes 2048 -MemoryMinimumBytes 2048 -CreateArcVMs
  ```
 
 Note:
@@ -236,7 +238,7 @@ Set-ClusterStorageSpacesDirect -CacheState Disabled;
 
  
 ```
-New-Fleet -basevhd <PATH TO VHDX> -adminpass [ENTER_ADMINPASS] -connectuser [ENTER_NODE_USER] -connectpass [ENTER_NODE_PASS]
+New-Fleet -basevhd <PATH TO VHDX> -vms [ENTER_NUM_VMS] -adminpass [ENTER_ADMINPASS] -connectuser [ENTER_NODE_USER] -connectpass [ENTER_NODE_PASS] -createArcVMs -resourceGroupForArcVM [ENTER_RESOURCE_GROUP] -azureRegistrationUser [ENTER_AZURE_REGUSER] -azureRegistrationPassword [ENTER_AZURE_REGPASS] -storagePathCsv [ENTER_CSV_PATH]
 ``` 
 
     -"adminpass" is the administrator password for the Server Core Image. This is the password you set on your Virtual Machine earlier.
@@ -246,6 +248,7 @@ New-Fleet -basevhd <PATH TO VHDX> -adminpass [ENTER_ADMINPASS] -connectuser [ENT
     -"createArcVMs" is the flag to turn on Arc enabled VM creation.
     -"resourceGroupForArcVM" is the resource group where ARC VMs will be deployed.
     -"azureRegistrationUser" and "azureRegistrationPassword" are the azure account credentials.
+    -"storagePathCsv" is the csv path where storage path resource will be created. If not provided, one of the existing csvs which were created earlier will be used by default. 
 
 
 10. Measure-FleetCoreWorkload also collects diagnostic data (Get-SDDCDiagnosticInfo). Therefore, before running the command, we must also install the NuGet Package if you have not previously done so. In doing so, we also need to temporairly set the PSGallery as a trusted repository source (Note: This will temporarily relax the security boundary). 
@@ -336,7 +339,7 @@ else {
 4. Run below command to create new fleet.
 
 ```
- New-Fleet -BaseVhd $baseImagePath -AdminPass $vmAdminPass -AzureRegistrationUser $azuser -AzureRegistrationPassword $azpasswrd -ConnectUser $domainAdmin -ConnectPass $domainAdminPass -VMs 30 -CreateArcVMs -ResourceGroupForArcVM VMFleetArcVMRG14;
+ New-Fleet -BaseVhd $baseImagePath -AdminPass $vmAdminPass -AzureRegistrationUser $azuser -AzureRegistrationPassword $azpasswrd -ConnectUser $domainAdmin -ConnectPass $domainAdminPass -VMs 30 -CreateArcVMs -ResourceGroupForArcVM VMFleetArcVMRG14 -StoragePathCSV "C:\csv-path";
 ```
 
 5. Run below command to deploy default VMFleet workload.
