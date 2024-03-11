@@ -1297,7 +1297,7 @@ $CommonFunc = {
             else {
                  Write-Host "Creating new Resource group $resourceGroup ..."
                  az group create --name $resourceGroup --location $location
-                 Start-Sleep 60               
+                 Start-Sleep 100               
             }
         $rbResourceGroup = ((Get-AzureStackHCI | select AzureResourceUri).AzureResourceUri).Split("/")[4]
         $customLocationResult = az customlocation list --resource-group $rbResourceGroup  | ConvertFrom-Json
@@ -2867,17 +2867,20 @@ function Remove-ArcVMFleet{
            [string]
            $resourceGroup
    )
-       $sp = az stack-hci-vm storagepath show --name $using:storagePathName --resource-group $resourceGroup | ConvertFrom-Json
-       $image = az stack-hci-vm image show --name $using:imageName --resource-group $resourceGroup | ConvertFrom-Json
-       if($image -ne $null){
-           LogOutput "Deleting image ..."
-           az stack-hci-vm image delete --name $using:imageName --resource-group $resourceGroup --yes
-           LogOutput "Deleted image"
+       $images = az stack-hci-vm image list --resource-group $resourceGroup | ConvertFrom-Json
+       $images | foreach { 
+            if($_.name.StartsWith("ArcVmFleetImage")) {
+                LogOutput "Deleting image - $($_.name)"
+                az stack-hci-vm image delete --name $_.name --resource-group $resourceGroup --yes
+            }
        }
-       if($sp -ne $null){
-           LogOutput "Deleting Storage Path"
-           az stack-hci-vm storagepath delete --name $using:storagePathName --resource-group $resourceGroup --yes
-       }
+       $storagePaths = az stack-hci-vm storagepath list --resource-group $resourceGroup | ConvertFrom-Json
+       $storagePaths | foreach { 
+            if($_.name.StartsWith("ArcVmFleetStoragePath")) {
+                LogOutput "Deleting Storage Path - $($_.name)"
+                az stack-hci-vm storagepath delete --name $_.name --resource-group $resourceGroup --yes
+            }
+       } 
    }
    LogOutput "Remove-ArcVMFleet completed for all nodes"
 }
@@ -3023,9 +3026,13 @@ function Start-Fleet
         [Parameter(ParameterSetName = "ByPercent")]
         [ValidateRange(1, 100)]
         [double]
-        $Percent = 100
-        )
+        $Percent = 100,
 
+        [Parameter(ParameterSetName = "ByNumber")]
+        [Parameter(ParameterSetName = "ByPercent")]
+        [switch]
+        $CreateArcVMs
+        )
     # Parameter set specifying cluster only
     $clusterParam = @{}
     CopyKeyIf $PSBoundParameters $clusterParam 'Cluster'
@@ -3056,9 +3063,11 @@ function Start-Fleet
             #
 
             # Start subset up to VM #n?
+            $position = -1
+            if($using:CreateArcVMs) { $position = -2 }
             $(if (0 -ne $n)
             {
-                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[-1] }
+                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[$position] }
 
                 LogOutput -IsVb "Starting up to VM $n"
             }
@@ -3067,9 +3076,8 @@ function Start-Fleet
             {
                 $n = [int] ($vms.Count * $pct / 100 / $using:numNode)
                 if ($n -eq 0) { $n = 1 }
-
-                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[-1] }
-
+                
+                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[$position] }
                 LogOutput -IsVb ("Starting {0:P1} ({1}) VMs / node" -f (
                     ($pct/100),
                     $n))
@@ -3792,7 +3800,7 @@ function Move-Fleet
             $arr = [collections.arraylist]@()
             foreach ($vm in $vms | Sort-Object -Property Name)
             {
-                if ($vm.Name -match "vm-.*-$($node.Name)-\d+$")
+                if ($vm.Name -match "vm-.*-$($node.Name)-\d+(?:-\w+)?$")
                 {
                     $null = $arr.Add($vm)
                 }
@@ -4225,11 +4233,13 @@ function Set-Fleet
         [switch]
         $Running,
 
+        [Parameter(ParameterSetName = 'SizeSpec')]
         [Parameter(ParameterSetName = 'DataDisk')]
         [Parameter(ParameterSetName = 'FullSpecDynamic')]
         [switch]
         $CreateArcVMs,
 
+        [Parameter(ParameterSetName = 'SizeSpec')]
         [Parameter(ParameterSetName = 'DataDisk')]
         [Parameter(ParameterSetName = 'FullSpecDynamic')]
         [string]
@@ -4308,10 +4318,12 @@ function Set-Fleet
                     if($p['CreateArcVMs'] -eq $true){
                         $name = $vm.Name
                         $cpuCount = $p['ProcessorCount']
-                        $memorymb = $p['MemoryStartupBytes']
+                        $memorymb = $p['MemoryStartupBytes']/1048576
                         $rg = $p['ResourceGroup']
                         # for now, this script only supports static memory for Arc vms
                         az stack-hci-vm update --name $name --v-cpus-available $cpuCount --memory-mb $memorymb --resource-group $rg
+                        # currently, vms go back to running state instead of original state before peforming an update
+                        az stack-hci-vm stop --name $name --resource-group $rg
                     }
                     else {
                         $vm | Set-VM @p
@@ -7067,7 +7079,15 @@ function Measure-FleetCoreWorkload
 
         [Parameter()]
         [switch]
-        $UseStorageQos
+        $UseStorageQos,
+
+        [Parameter()]
+        [switch]
+        $CreateArcVMs,
+
+        [Parameter()]
+        [string]
+        $ResourceGroup
     )
 
     # Remoting parametersets
@@ -7149,7 +7169,13 @@ function Measure-FleetCoreWorkload
             $VMPercent = 100,
 
             [switch]
-            $KeyColumn
+            $KeyColumn,
+            
+            [switch]
+            $CreateArcVMs,
+
+            [string]
+            $ResourceGroup
         )
 
         if ($KeyColumn)
@@ -7161,20 +7187,26 @@ function Measure-FleetCoreWorkload
             $myKeyColumn.FleetVMPercent = $VMPercent
         }
         else
-        { Set-Fleet @clusterParam -ComputeTemplate $myKeyColumn.ComputeTemplate }
+        {Set-Fleet @clusterParam -ComputeTemplate $myKeyColumn.ComputeTemplate -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup }
     }
 
     function ApplyVMDataDisk
     {
         param(
             [switch]
-            $KeyColumn
+            $KeyColumn,
+
+            [switch]
+            $CreateArcVMs,
+
+            [string]
+            $ResourceGroup
+
         )
 
         if ($KeyColumn)
         {
             $dataDiskSize = Get-FleetDataDiskEstimate @clusterParam -CachePercent 200 -CapacityPercent 30 -VMPercent $myKeyColumn.FleetVMPercent -Verbose
-
             # Opt to use internal load file if disk size would be smaller.
             # This can happen in storage limited/compute rich builds.
             if ($dataDiskSize -le 10GB)
@@ -7185,8 +7217,7 @@ function Measure-FleetCoreWorkload
         }
         else
         {
-            $d = Set-Fleet -DataDiskSize $myKeyColumn.DataDiskBytes -Running
-
+            $d = Set-Fleet -DataDiskSize $myKeyColumn.DataDiskBytes -Running -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
             # If data disks were newly created, execute write warmup.
             if ($null -ne $d)
             {
@@ -7199,11 +7230,10 @@ function Measure-FleetCoreWorkload
     {
         if ($state.ContainsKey('startVM')) { return }
         $state.startVM = $true
-
         AlignVM
-        ApplyVMTemplate $myKeyColumn.ComputeTemplate $myKeyColumn.FleetVMPercent
-        Start-Fleet @clusterParam -Percent $myKeyColumn.FleetVMPercent
-        ApplyVMDataDisk
+        ApplyVMTemplate $myKeyColumn.ComputeTemplate $myKeyColumn.FleetVMPercent -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        Start-Fleet @clusterParam -Percent $myKeyColumn.FleetVMPercent -CreateArcVMs:$CreateArcVMs
+        ApplyVMDataDisk -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
     }
 
     function AlignVM
@@ -7323,9 +7353,8 @@ function Measure-FleetCoreWorkload
 
         $state = @{}
         Stop-Fleet @clusterParam
-        ApplyVMTemplate -KeyColumn A1v2 100
-        ApplyVMDataDisk -KeyColumn
-
+        ApplyVMTemplate -KeyColumn A1v2 100 -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        ApplyVMDataDisk -KeyColumn -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
         foreach ($alignment in 100,70)
         {
             $myKeyColumn.VMAlignmentPct = $alignment
@@ -7339,9 +7368,8 @@ function Measure-FleetCoreWorkload
 
         $state = @{}
         Stop-Fleet @clusterParam
-        ApplyVMTemplate -KeyColumn A4v2 25
-        ApplyVMDataDisk -KeyColumn
-
+        ApplyVMTemplate -KeyColumn A4v2 25 -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        ApplyVMDataDisk -KeyColumn -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
         foreach ($alignment in 100,70)
         {
             $myKeyColumn.VMAlignmentPct = $alignment
