@@ -125,6 +125,7 @@ FunctionsToExport = @(
     'Set-FleetPowerScheme',
     'Set-FleetProfile',
     'Set-FleetQoS',
+    'Set-FleetRunProfileScript',
     'Show-Fleet',
     'Show-FleetCpuSweep',
     'Show-FleetPause',
@@ -138,7 +139,9 @@ FunctionsToExport = @(
     'Test-FleetResultRun',
     'Use-FleetPolynomialFit',
     'Watch-FleetCluster',
-    'Watch-FleetCPU'
+    'Watch-FleetCPU',
+    'Initialize-ArcVMs',
+    'Remove-ArcVMFleet'
 )
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.

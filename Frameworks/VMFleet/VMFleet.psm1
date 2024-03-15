@@ -86,6 +86,11 @@ class VolumeEstimate
 
 $vmSwitchName = 'FleetInternal'
 $vmSwitchIP = '169.254.1.1'
+#Note: These constants are required for Arc VM 
+$randomString = -join ((0x30..0x39) + ( 0x41..0x5A) + ( 0x61..0x7A) | Get-Random -Count 4  | % { [char]$_ })
+$storagePathName = "ArcVmFleetStoragePath$randomString"
+$imageName = "ArcVmFleetImage$randomString"
+
 
 # Note: this can be directly determined by Get-SmbClientConfiguration. Changes are not expected, but
 # since the controlling timeout is in the guest lets simply wire it down. Actual is normally 10s, use
@@ -1273,6 +1278,163 @@ $CommonFunc = {
             [pscustomobject] $props
         }
     }
+
+    # Initializes Archci configs and retrieves extended location required for resource creation using Azure CLI
+    function InitializeAndGetArcHCIExtendedLoc($azUser, $azPassword, $resourceGroup) {
+        az config set extension.use_dynamic_install=yes_without_prompt core.encrypt_token_cache=false core.disable_confirm_prompt=true core.only_show_errors=true;
+        $subscription = ((Get-AzureStackHCI | select AzureResourceUri).AzureResourceUri).Split("/")[2]
+        $location = (Get-AzureStackHCI | select Region).Region
+        $isLoggedIn = az login -u $azUser -p $azPassword
+        if($isLoggedIn -eq $null){
+           throw "Azure login failed with error - $isLoggedIn"
+        }
+        az account set -s $subscription
+        try{
+           $groupResult = az group show --name $resourceGroup | ConvertFrom-Json
+            if ($groupResult.properties.provisioningState -eq "Succeeded") {
+                Write-Host "Resource group $resourceGroup already exists"
+            }
+            else {
+                 Write-Host "Creating new Resource group $resourceGroup ..."
+                 az group create --name $resourceGroup --location $location
+                 Start-Sleep 100               
+            }
+        $rbResourceGroup = ((Get-AzureStackHCI | select AzureResourceUri).AzureResourceUri).Split("/")[4]
+        $customLocationResult = az customlocation list --resource-group $rbResourceGroup  | ConvertFrom-Json
+        $extendedLocation = $customLocationResult[0].id # by default uses the first available custom location
+        }
+        catch{
+            throw $_.Exception.Message
+        }
+        return $extendedLocation
+    }
+
+    function ApplySpecialization( $path, $vmspec, $admin, $adminPass, $connectUser, $connectPass ) {
+        # all steps here can fail immediately without cleanup
+
+        # error accumulator
+        $ok = $true
+
+        # create run directory
+
+        Remove-Item -Recurse -Force z:\run -ErrorAction SilentlyContinue
+        mkdir z:\run
+        $ok = $ok -band $?
+        if (-not $ok) {
+            Write-Error "failed run directory creation for $vhdpath"
+            return $ok
+        }
+
+        # autologon
+        $null = reg load 'HKLM\tmp' z:\windows\system32\config\software
+        $ok = $ok -band $?
+        $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v DefaultUserName /t REG_SZ /d $admin
+        $ok = $ok -band $?
+        $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v DefaultPassword /t REG_SZ /d $adminPass
+        $ok = $ok -band $?
+        $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v AutoAdminLogon /t REG_DWORD /d 1
+        $ok = $ok -band $?
+        $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v Shell /t REG_SZ /d 'powershell.exe -noexit -command C:\users\administrator\launch.ps1'
+        $ok = $ok -band $?
+
+        $null = reg unload 'HKLM\tmp'
+        $ok = $ok -band $?
+        if (-not $ok) {
+            Write-Error "failed autologon injection for $vhdpath"
+            return $ok
+        }
+
+        # scripts
+
+        Copy-Item -Force C:\ClusterStorage\collect\control\control.ps1 z:\run\control.ps1
+        $ok = $ok -band $?
+        if (-not $ok) {
+            Write-Error "failed injection of specd master.ps1 for $vhdpath"
+            return $ok
+        }
+
+        #
+        # Wrapper for the controller script to auto-restart on failure/update.
+        # This is the autologin script itself.
+        #
+        function Set-FleetLauncherScript {
+            $script = 'C:\run\control.ps1'
+
+            while ($true) {
+                Write-Host -fore Green Launching $script `@ $(Get-Date)
+                try { & $script -connectuser __CONNECTUSER__ -connectpass __CONNECTPASS__ } catch {}
+                Start-Sleep -Seconds 1
+            }
+        }
+
+        Remove-Item -Force z:\users\administrator\launch.ps1 -ErrorAction SilentlyContinue
+        (Get-Command Set-FleetLauncherScript).ScriptBlock | % {
+           $_ -replace '__CONNECTUSER__',$connectUser -replace '__CONNECTPASS__',$connectPass
+        } > z:\users\administrator\launch.ps1
+        $ok = $ok -band $?
+        if (-not $ok) {
+            Write-Error "failed injection of launch.ps1 for $vhdpath"
+            return $ok
+        }
+
+        Write-Output $vmspec > z:\vmspec.txt
+        $ok = $ok -band $?
+        if (-not $ok) {
+            Write-Error "failed injection of vmspec for $vhdpath"
+            return $ok
+        }
+
+        # load files
+        $f = 'z:\run\testfile1.dat'
+        if (-not (Get-Item $f -ErrorAction SilentlyContinue)) {
+            fsutil file createnew $f (10GB)
+            $ok = $ok -band $?
+            fsutil file setvaliddata $f (10GB)
+            $ok = $ok -band $?
+        }
+        if (-not $ok) {
+            Write-Error "failed creation of initial load file for $vhdpath"
+            return $ok
+        }
+
+        return $ok
+    }
+
+    function SpecializeVhd {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)][string]$vhdpath,
+            [Parameter(Mandatory = $true)][string]$admin,
+            [Parameter(Mandatory = $true)][string]$adminPass,
+            [Parameter(Mandatory = $true)][string]$connectUser,
+            [Parameter(Mandatory = $true)][string]$connectPass,
+            [Parameter(Mandatory = $false)][string]$name
+        )
+        $ok = $true
+        $vhd = (Get-Item $vhdpath)
+        if ($name) {
+            $vmspec = $name
+        }
+        else {
+            $vmspec = $vhd.BaseName  
+        }
+
+
+        # mount vhd and its largest partition
+        $o = Mount-VHD $vhd -NoDriveLetter -Passthru
+        if ($null -eq $o) {
+            Write-Error "failed mount for $vhdpath"
+            return $false
+        }
+        $p = Get-Disk -number $o.DiskNumber | Get-Partition | Sort-Object -Property size -Descending | Select-Object -first 1
+        $p | Add-PartitionAccessPath -AccessPath Z:
+        $ok = ApplySpecialization Z: $vmspec $admin $adminPass $connectUser $connectPass
+
+        Remove-PartitionAccessPath -AccessPath Z: -InputObject $p
+        Dismount-VHD -DiskNumber $o.DiskNumber
+
+        return $ok
+    }
 }
 
 # Evaluate common block into local session
@@ -2136,7 +2298,36 @@ function New-Fleet
         [Parameter(ParameterSetName = "ByCluster")]
         [Parameter(ParameterSetName = "ByNode")]
         [switch]
-        $KeepVHD
+        $KeepVHD,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [switch]
+        $CreateArcVMs,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $ResourceGroupForArcVM = 'VMFleetArcVMRG',
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $AzureRegistrationUser,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $AzureRegistrationPassword,
+
+        [Parameter(ParameterSetName = "ByCluster")]
+        [Parameter(ParameterSetName = "ByNode")]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $StoragePathCsv
     )
 
     # Parameter set specifying cluster only
@@ -2233,12 +2424,11 @@ function New-Fleet
         }
 
         $VMs = ($g[0].Group.NumberOfEnabledCore | Measure-Object -Sum).Sum / $nodes.Count
-
         LogOutput -IsVb "Autoscaling number of VMs to $VMs / node"
     }
 
     # Create the fleet vmswitches with a fixed IP at the base of the APIPA range
-    Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ScriptBlock {
+   Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ScriptBlock {
 
         if (-not (Get-VMSwitch -Name $using:vmSwitchName -ErrorAction SilentlyContinue)) {
 
@@ -2246,11 +2436,6 @@ function New-Fleet
             $null = Get-NetAdapter |? DriverDescription -eq 'Hyper-V Virtual Ethernet Adapter' |? Name -eq "vEthernet ($($using:vmSwitchName))" | New-NetIPAddress -PrefixLength 16 -IPAddress $using:vmSwitchIP
             LogOutput "CREATE internal vmswitch $($using:vmSwitchName) @ $($env:COMPUTERNAME)"
         }
-    }
-
-    #### STOPAFTER
-    if (Stop-After "CreateVMSwitch" $stopafter) {
-        return
     }
 
     # create $vms vms per each csv named as <nodename><group prefix>
@@ -2263,127 +2448,76 @@ function New-Fleet
         FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
     }}
 
-    Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ArgumentList @(,$csvs) -ScriptBlock {
-
-        param($csvs)
-
-        function ApplySpecialization( $path, $vmspec )
-        {
-            # all steps here can fail immediately without cleanup
-
-            # error accumulator
-            $ok = $true
-
-            # create run directory
-
-            Remove-Item -Recurse -Force z:\run -ErrorAction SilentlyContinue
-            mkdir z:\run
-            $ok = $ok -band $?
-            if (-not $ok) {
-                Write-Error "failed run directory creation for $vhdpath"
-                return $ok
-            }
-
-            # autologon
-            $null = reg load 'HKLM\tmp' z:\windows\system32\config\software
-            $ok = $ok -band $?
-            $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v DefaultUserName /t REG_SZ /d $using:admin
-            $ok = $ok -band $?
-            $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v DefaultPassword /t REG_SZ /d $using:adminpass
-            $ok = $ok -band $?
-            $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v AutoAdminLogon /t REG_DWORD /d 1
-            $ok = $ok -band $?
-            $null = reg add 'HKLM\tmp\Microsoft\Windows NT\CurrentVersion\WinLogon' /f /v Shell /t REG_SZ /d 'powershell.exe -noexit -command C:\users\administrator\launch.ps1'
-            $ok = $ok -band $?
-
-            $null = reg unload 'HKLM\tmp'
-            $ok = $ok -band $?
-            if (-not $ok) {
-                Write-Error "failed autologon injection for $vhdpath"
-                return $ok
-            }
-
-            # scripts
-
-            Copy-Item -Force C:\ClusterStorage\collect\control\control.ps1 z:\run\control.ps1
-            $ok = $ok -band $?
-            if (-not $ok) {
-                Write-Error "failed injection of specd master.ps1 for $vhdpath"
-                return $ok
-            }
-
-            #
-            # Wrapper for the controller script to auto-restart on failure/update.
-            # This is the autologin script itself.
-            #
-            function Set-FleetLauncherScript
-            {
-                $script = 'C:\run\control.ps1'
-
-                while ($true) {
-                    Write-Host -fore Green Launching $script `@ $(Get-Date)
-                    try { & $script -connectuser __CONNECTUSER__ -connectpass __CONNECTPASS__ } catch {}
-                    Start-Sleep -Seconds 1
+    # Create Gallery Image and Storage Path Arc resources if Arc VM flag set to true
+    if ($CreateArcVMs) {
+        if(-not $PSBoundParameters.ContainsKey("StoragePathCsv")){
+            foreach ($csv in $csvs) {
+                # identify the Csv which can be used to create storage path
+                # the trailing characters (if any) are the group prefix
+                if ($csv.VDName -match "^$env:COMPUTERNAME(?:-.+){0,1}") {
+                    $StoragePathCsv = $csv.FriendlyVolumeName
+                    break
                 }
             }
+        }
+        $result =  Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @($ResourceGroupForArcVM,$BaseVHD, $AzureRegistrationUser, $AzureRegistrationPassword, $StoragePathCsv)  -ScriptBlock {  
+            param($resourceGroup, $vhdPath, $azUser, $azPassword, $storagePathCsv)
+            $azRetry = $true
+            $retryCount = 0
+            while($azRetry -and $retryCount -lt 3){
+                try{
+                    $spCreated = $false
+                    $imgCreated = $false
+                    $extendedLocation = InitializeAndGetArcHCIExtendedLoc $azUser $azPassword $resourceGroup
+                    if ($extendedLocation -eq $null) {
+                        LogOutput -ForegroundColor Red "Error generating Extended Location value - $extendedLocation"
+                        return "Error occurred while getting extended location"
+                    }
 
-            Remove-Item -Force z:\users\administrator\launch.ps1 -ErrorAction SilentlyContinue
-            (Get-Command Set-FleetLauncherScript).ScriptBlock |% {
-                $_ -replace '__CONNECTUSER__',$using:connectuser -replace '__CONNECTPASS__',$using:connectpass
-            } > z:\users\administrator\launch.ps1
-            $ok = $ok -band $?
-            if (-not $ok) {
-                Write-Error "failed injection of launch.ps1 for $vhdpath"
-                return $ok
+                    LogOutput "Creating storage path $using:storagePathName..."
+                    $location = (Get-AzureStackHCI | select Region).Region
+                    $spResult = (az stack-hci-vm storagepath create --name $using:storagePathName --resource-group $resourceGroup --custom-location $extendedLocation --path $storagePathCsv --location $location) | ConvertFrom-Json
+                    if ($spResult.properties.provisioningState -eq "Succeeded") {
+                        LogOutput "Storage path $using:storagePathName created successfully, creating image with $vhdPath..."
+                        $spCreated = $true
+                        # currently, only windows image is supported
+                        $imgResult = az stack-hci-vm image create --name $using:imageName --resource-group $resourceGroup --location $location --custom-location $extendedLocation --os-type Windows --storage-path-id $spResult.id --image-path $vhdPath | ConvertFrom-Json
+                        if ($imgResult.properties.provisioningState -eq "Succeeded") {
+                             $imgCreated = $true
+                             LogOutput "Image $using:imageName created successfully"
+                             LogOutput -ForegroundColor Green "Finished creating resources using az cli"
+                             Start-Sleep -Seconds 150 # cool off period
+                             $azRetry = $false
+                        }     
+                    }   
+                   if (-not $spCreated -or -not $imgCreated) {
+                       LogOutput -ForegroundColor Red "Error occurred while creating storage path and image. Please check logs."
+                       throw "Error occurred while creating az resources at retry count - $retryCount"
+                   }
+                }
+                catch {
+                   $retryCount = $retryCount+1
+                   if($retryCount -eq 3){
+                        return "Error occurred while creating az resources for all retry counts"                        
+                   }
+                }
             }
-
-            Write-Output $vmspec > z:\vmspec.txt
-            $ok = $ok -band $?
-            if (-not $ok) {
-                Write-Error "failed injection of vmspec for $vhdpath"
-                return $ok
-            }
-
-            # load files
-            $f = 'z:\run\testfile1.dat'
-            if (-not (Get-Item $f -ErrorAction SilentlyContinue)) {
-                fsutil file createnew $f (10GB)
-                $ok = $ok -band $?
-                fsutil file setvaliddata $f (10GB)
-                $ok = $ok -band $?
-            }
-            if (-not $ok) {
-                Write-Error "failed creation of initial load file for $vhdpath"
-                return $ok
-            }
-
-            return $ok
         }
 
-        function SpecializeVhd( $vhdpath )
-        {
-            $vhd = (Get-Item $vhdpath)
-            $vmspec = $vhd.BaseName
-
-            # mount vhd and its largest partition
-            $o = Mount-VHD $vhd -NoDriveLetter -Passthru
-            if ($null -eq $o) {
-                Write-Error "failed mount for $vhdpath"
-                return $false
-            }
-            $p = Get-Disk -number $o.DiskNumber | Get-Partition | Sort-Object -Property size -Descending | Select-Object -first 1
-            $p | Add-PartitionAccessPath -AccessPath Z:
-
-            $ok = ApplySpecialization Z: $vmspec
-
-            Remove-PartitionAccessPath -AccessPath Z: -InputObject $p
-            Dismount-VHD -DiskNumber $o.DiskNumber
-
-            return $ok
+        if($result -ne $null -and $result.Contains("Error")){
+            return $result
         }
+    }
+  
+    #### STOPAFTER
+    if (Stop-After "CreateVMSwitch" $stopafter) {
+        return
+    }
 
+    Invoke-CommonCommand $nodes -InitBlock $CommonFunc -ArgumentList @($csvs, $CreateArcVMs, $ResourceGroupForArcVM, $AzureRegistrationUser, $AzureRegistrationPassword) -ScriptBlock {
+
+        param($csvs, $createArcVMs, $resourceGroup, $azuser, $azpassword)
         foreach ($csv in $csvs) {
-
             if ($($using:groups).Length -eq 0) {
                 $groups = @( 'base' )
             } else {
@@ -2409,7 +2543,13 @@ function New-Fleet
                     $stop = $false
 
                     $newvm = $false
-                    $name = ("vm-$g-$env:COMPUTERNAME-{0:000}" -f $vm)
+                    if($createArcVMs) {
+                       $vmRandomString = -join ((0x30..0x39) + ( 0x41..0x5A) + ( 0x61..0x7A) | Get-Random -Count 6  | % { [char]$_ })
+                       $name = ("vm-$g-$env:COMPUTERNAME-{0:000}-$vmRandomString" -f $vm)
+                    }
+                    else {
+                       $name = ("vm-$g-$env:COMPUTERNAME-{0:000}" -f $vm)
+                    }
 
                     $placePath = $csv.FriendlyVolumeName
                     $vmPath = Join-Path $placePath $name
@@ -2417,11 +2557,6 @@ function New-Fleet
 
                     # if the vm cluster group exists, we are already deployed
                     if (-not (Get-ClusterGroup -Name $name -ErrorAction SilentlyContinue)) {
-
-                        if (-not $stop) {
-                            $stop = Stop-After "AssertComplete"
-                        }
-
                         if ($stop) {
 
                             LogOutput -ForegroundColor Red "vm $name not deployed"
@@ -2440,47 +2575,113 @@ function New-Fleet
 
                                 # interrupted between vm creation and role creation; redo it
                                 LogOutput "REMOVE vm $name for re-creation"
-
                                 if ($o.State -ne 'Off') {
                                     Stop-VM -Name $name -TurnOff -Force -Confirm:$false
+                                }    
+                                if($createArcVMs){
+                                    az stack-hci-vm delete --name $name --resource-group $resourceGroup --yes
                                 }
-                                Remove-VM -Name $name -Force -Confirm:$false
+                                else {                        
+                                    Remove-VM -Name $name -Force -Confirm:$false
+                                }
                             }
-
-                            # scrub and re-create the vm metadata path and vhd
-                            if (Test-Path $vmPath)
-                            {
-                                Remove-Item -Recurse $vmPath
-                            }
-
-                            $null = New-Item -ItemType Directory $vmPath
-                            Copy-Item $using:BaseVHD $vhdPath
-
-                            #### STOPAFTER
-                            if (-not $stop) {
-                                $stop = Stop-After "CopyVHD" $using:stopafter
-                            }
-
-                            if (-not $stop) {
-
-                                # Create A1 VM. use set-vmfleet to alter fleet sizing post-creation.
-                                # Do not monitor the internal switch connection; this allows live migration
-                                # despite the internal switch.
-                                $o = New-VM -VHDPath $vhdPath -Generation 2 -SwitchName $using:vmSwitchName -Path $placePath -Name $name
-                                if ($null -ne $o)
+                            # we do not need to copy vhd for Arc vms. It is done by the product code itself
+                            if($createArcVMs -eq $false){
+                                # scrub and re-create the vm metadata path and vhd
+                                if (Test-Path $vmPath)
                                 {
-                                    $o | Set-VM -ProcessorCount 1 -MemoryStartupBytes 1.75GB -StaticMemory
-                                    $o | Get-VMNetworkAdapter | Set-VMNetworkAdapter -NotMonitoredInCluster $true
+                                    Remove-Item -Recurse $vmPath
+                                }
+
+                                $null = New-Item -ItemType Directory $vmPath
+                                Copy-Item $using:BaseVHD $vhdPath
+
+                                #### STOPAFTER
+                                if (-not $stop) {
+                                    $stop = Stop-After "CopyVHD" $using:stopafter
+                                }
+
+                                if (-not $stop) {
+
+                                    # Create A1 VM. use set-vmfleet to alter fleet sizing post-creation.
+                                    # Do not monitor the internal switch connection; this allows live migration
+                                    # despite the internal switch.
+                                    $o = New-VM -VHDPath $vhdPath -Generation 2 -SwitchName $using:vmSwitchName -Path $placePath -Name $name
+                                    if ($null -ne $o)
+                                    {
+                                        $o | Set-VM -ProcessorCount 1 -MemoryStartupBytes 1.75GB -StaticMemory
+                                        $o | Get-VMNetworkAdapter | Set-VMNetworkAdapter -NotMonitoredInCluster $true
+                                    }
                                 }
                             }
-
+                            else {
+                                    $azRetry = $true
+                                    [int]$Retrycount = "0"
+                                    while($azRetry -and $Retrycount -lt 3){
+                                        try{
+                                             $vmResult = $null
+                                             $extendedLocation = InitializeAndGetArcHCIExtendedLoc $azuser $azpassword $resourceGroup
+                                             $location = (Get-AzureStackHCI | select Region).Region
+                                             $computerName = -join ((65..90) + (97..122) | Get-Random -Count 5 | % { [char]$_ })
+                                             LogOutput "Creating Arc HCI VM - $name ..."
+                                             $vmResult = az stack-hci-vm create --name $name --resource-group $resourceGroup --admin-username $using:admin --admin-password $using:adminpass --computer-name $computerName --location $location --enable-agent False --enable-vm-config-agent false --os-type "Windows" --custom-location $extendedLocation --image $using:imageName --storage-path-id  $using:storagePathName --hardware-profile memory-mb="2048" processors="1" vm-size="Custom"
+                                             LogOutput "Result returned for $name - $vmResult"
+                                             if($vmResult -eq $null){
+                                                 $msg = "Error creating Virtual machine $name at retry count $retryCount"
+                                                 Write-Host -ForegroundColor Yellow $msg
+                                                 throw $msg
+                                             }
+                                             $azRetry = $false
+                                        }
+                                        catch {
+                                           $Retrycount = $Retrycount+1
+                                           if($Retrycount -eq 3){
+                                                LogOutput -ForegroundColor Yellow "Error occurred while creating $name for all retry counts"
+                                                $stop = $true
+                                                $azRetry = $false
+                                           }
+                                        }
+                                    }
+                                    if (-not $stop) {
+                                        # hyperv Arc VM names
+                                        $vmname = "Virtual Machine " + $name
+                                        $Stoploop = $false
+                                        [int]$Retrycount = "0"
+                                        do {
+                                            try {
+                                                LogOutput "Executing Get-ClusterResource -Name $vmname | Get-VM"
+                                                $o = Get-ClusterResource -Name $vmname
+                                                $ownerNode = Get-ClusterResource -Name $vmname | Select-Object OwnerNode
+                                                if ($o -eq $null) {
+                                                    throw "Null returned by Get-ClusterResource due to some error"
+                                                }
+                                                else {
+                                                   LogOutput "Creation of vm completed at hyperv level"
+                                                    $Stoploop = $true
+                                                }
+                                            }
+                                            catch {
+                                                if ($Retrycount -gt 10) {
+                                                    LogOutput "Could not get VM $vmname after 10 retries using Get-ClusterResource"
+                                                    $Stoploop = $true
+                                                }
+                                                else {
+                                                    Write-Host "Could not get VM $vmname at $RetryCount retry count. Retrying in 6 minutes..."
+                                                    LogOutput "Starting with some sleep time"
+                                                    Start-Sleep -Seconds 360
+                                                    $Retrycount = $Retrycount + 1
+                                                }
+                                            }
+                                        }
+                                        While ($Stoploop -eq $false)      
+                                    }
+                            }
                             #### STOPAFTER
                             if (-not $stop) {
                                 $stop = Stop-After "CreateVM" $using:stopafter
                             }
 
-                            if (-not $stop) {
-
+                            if (-not $stop -and $createArcVMs -ne $true) {
                                 # Create clustered vm role (don't emit) and assign default owner node.
                                 # Swallow the (expected) warning that will be referring to the internal
                                 # vmswitch as being a local-only resource. Since we replicate the vswitch
@@ -2501,12 +2702,12 @@ function New-Fleet
                         $stop = Stop-After "CreateVMGroup" $using:stopafter
                     }
 
-                    if (-not $stop -or ($using:specialize -eq 'Force')) {
+                    if ((-not $stop -or ($using:specialize -eq 'Force')) -and $createArcVMs -ne $true) {
                         # specialize as needed
                         # auto only specializes new vms; force always; none skips it
                         if (($using:specialize -eq 'Auto' -and $newvm) -or ($using:specialize -eq 'Force')) {
                             LogOutput "SPECIALIZE vm $name"
-                            if (-not (SpecializeVhd $vhdPath)) {
+                            if (-not (SpecializeVhd $vhdPath $using:admin $using:adminpass $using:connectuser $using:connectpass)) {
                                 LogOutput -ForegroundColor red "Failed specialize of vm $name @ $vhdPath, halting."
                             }
                         } else {
@@ -2517,6 +2718,171 @@ function New-Fleet
             }
         }
     }
+    if($CreateArcVMs -eq $true){
+    Stop-Fleet
+    LogOutput "Updating network adapter for Fleet to add internal switch"
+    $clusterName = (Get-Cluster).Name
+    $nodes = @(Get-ClusterNode -Cluster $clusterName | ? State -eq Up)
+    foreach ($o in Get-VM -CimSession $nodes.Name | ? Name -like 'vm-*') {
+           $o | Add-VMNetworkAdapter -SwitchName $vmSwitchName
+           $o | Get-VMNetworkAdapter | Connect-VMNetworkAdapter -SwitchName $vmSwitchName        
+           $o | Get-VMNetworkAdapter | Set-VMNetworkAdapter -NotMonitoredInCluster $true
+           Set-ClusterOwnerNode -Group $o.VMName -Owners $env:COMPUTERNAME
+           LogOutput "Network Adapter attached to VM"
+    }
+    Stop-Fleet
+    Initialize-ArcVMs $admin $adminpass $connectuser $connectpass
+    }
+}
+
+# Initialize Arc VMs
+function Initialize-ArcVMs ($admin ,$adminpass, $connectuser, $connectpass){
+    $clusterName = (Get-Cluster).Name
+    $nodes = @(Get-ClusterNode -Cluster $clusterName | ? State -eq Up)
+    foreach ($vm in Get-VM -CimSession $nodes.Name | ? Name -like 'vm-*') {
+        $vmname = "Virtual Machine " + $vm.Name
+        $name = $vm.Name
+        $vhdPath = $null
+        # finds os disk for each vm
+        $csvs = GetMappedCSV $clusterName |% { [PSCustomObject]@{
+            FriendlyVolumeName = $_.SharedVolumeInfo.FriendlyVolumeName
+        }}
+        foreach ($csv in $csvs) {
+            $csvpath = $csv.FriendlyVolumeName
+            $filepath = "C:\$name.txt"
+            Get-ChildItem -Path $csvpath -recurse -Filter *$name*OSDisk*.vhdx | Select -ExpandProperty Fullname | Out-File $filepath
+            $vhdPath = Get-Content $filepath
+            if ($vhdPath -ne $null) {
+                break
+            }
+        }
+        if (-not (SpecializeVhd $vhdPath $admin $adminpass $connectuser $connectpass $name)) {
+            LogOutput -ForegroundColor red "Failed specialize of vm $name @ $vhdPath, halting."
+        }
+        else { LogOutput -ForegroundColor green "Successfully Specialized $name" }
+    }
+}
+
+# removes Arc VM fleet and related resources using Azure cli
+function Remove-ArcVMFleet{
+  [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]
+        $Cluster = ".",
+
+        [Parameter()]
+        [string[]]
+        $VMs,
+
+        [Parameter()]
+        [string]
+        $ResourceGroup,
+
+        [Parameter()]
+        [string]
+        $Azuser,
+
+        [Parameter()]
+        [string]
+        $Azpass
+    )
+    # Parameter set specifying cluster only
+    $clusterParam = @{}
+    CopyKeyIf $PSBoundParameters $clusterParam 'Cluster'
+
+    if ($vms)
+    {
+        LogOutput -IsVb "Removing VM Fleet content for: $vms"
+    }
+    else
+    {
+        LogOutput -IsVb "Removing VM Fleet"
+    }
+
+    # stop and remove clustered vm roles
+    Get-ClusterGroup @clusterParam |? GroupType -eq VirtualMachine |? {
+
+        if ($vms)
+        {
+            $_.Name -in $vms
+        }
+        else
+        {
+            $_.Name -like 'vm-*'
+        }
+    } |% {
+
+        LogOutput -IsVb "Removing ClusterGroup for $($_.Name)"
+        $null = $_ | Stop-ClusterGroup
+        $_ | Remove-ClusterGroup -RemoveResources -Force
+    }
+
+    # Capture flag file path for the installation
+    $flagPath = Get-FleetPath -PathType Flag @clusterParam
+
+    # remove all vms
+    Invoke-CommonCommand (Get-ClusterNode @clusterParam) -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroup,$Azuser, $Azpass) -ScriptBlock {
+                    [CmdletBinding()]
+                    param(
+                        [string]
+                        $resourceGroup, 
+                        [string]
+                        $azuser,
+                        [string]
+                        $azpass
+                    )
+
+        $extendedLocation = InitializeAndGetArcHCIExtendedLoc $azuser $azpass $resourceGroup
+        Get-VM |? {
+            if ($using:vms)
+            {
+                $_.Name -in $using:vms
+            }
+            else
+            {
+                $_.Name -like 'vm-*'
+            }
+        } |% {
+            $vmName = $_.Name
+            LogOutput "Removing VM for $($_.Name) @ $($env:COMPUTERNAME)"
+           
+            $result = az stack-hci-vm delete --name $vmName --resource-group $resourceGroup --yes
+            LogOutput "Result returned for removing $vmName - $result"
+        }
+        if ($null -eq $vms)
+        {
+            $switch = Get-VMSwitch -SwitchType Internal
+            if ($null -ne $switch)
+            {
+                LogOutput "Removing Internal VMSwitch @ $($env:COMPUTERNAME)"
+                $switch | Remove-VMSwitch -Confirm:$False -Force
+            }
+        }
+   }
+   $nodes = Get-ClusterNode @clusterParam
+   Invoke-CommonCommand $nodes[0] -InitBlock $CommonFunc -ArgumentList @(,$ResourceGroup) -ScriptBlock {
+       [CmdletBinding()]
+       param(
+           [string]
+           $resourceGroup
+   )
+       $images = az stack-hci-vm image list --resource-group $resourceGroup | ConvertFrom-Json
+       $images | foreach { 
+            if($_.name.StartsWith("ArcVmFleetImage")) {
+                LogOutput "Deleting image - $($_.name)"
+                az stack-hci-vm image delete --name $_.name --resource-group $resourceGroup --yes
+            }
+       }
+       $storagePaths = az stack-hci-vm storagepath list --resource-group $resourceGroup | ConvertFrom-Json
+       $storagePaths | foreach { 
+            if($_.name.StartsWith("ArcVmFleetStoragePath")) {
+                LogOutput "Deleting Storage Path - $($_.name)"
+                az stack-hci-vm storagepath delete --name $_.name --resource-group $resourceGroup --yes
+            }
+       } 
+   }
+   LogOutput "Remove-ArcVMFleet completed for all nodes"
 }
 
 function Remove-Fleet
@@ -2660,9 +3026,13 @@ function Start-Fleet
         [Parameter(ParameterSetName = "ByPercent")]
         [ValidateRange(1, 100)]
         [double]
-        $Percent = 100
-        )
+        $Percent = 100,
 
+        [Parameter(ParameterSetName = "ByNumber")]
+        [Parameter(ParameterSetName = "ByPercent")]
+        [switch]
+        $CreateArcVMs
+        )
     # Parameter set specifying cluster only
     $clusterParam = @{}
     CopyKeyIf $PSBoundParameters $clusterParam 'Cluster'
@@ -2693,9 +3063,11 @@ function Start-Fleet
             #
 
             # Start subset up to VM #n?
+            $position = -1
+            if($using:CreateArcVMs) { $position = -2 }
             $(if (0 -ne $n)
             {
-                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[-1] }
+                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[$position] }
 
                 LogOutput -IsVb "Starting up to VM $n"
             }
@@ -2704,9 +3076,8 @@ function Start-Fleet
             {
                 $n = [int] ($vms.Count * $pct / 100 / $using:numNode)
                 if ($n -eq 0) { $n = 1 }
-
-                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[-1] }
-
+                
+                $vms |? OwnerNode -eq $env:COMPUTERNAME |? { $n -ge [int] ($_.Name -split '-')[$position] }
                 LogOutput -IsVb ("Starting {0:P1} ({1}) VMs / node" -f (
                     ($pct/100),
                     $n))
@@ -3429,7 +3800,7 @@ function Move-Fleet
             $arr = [collections.arraylist]@()
             foreach ($vm in $vms | Sort-Object -Property Name)
             {
-                if ($vm.Name -match "vm-.*-$($node.Name)-\d+$")
+                if ($vm.Name -match "vm-.*-$($node.Name)-\d+(?:-\w+)?$")
                 {
                     $null = $arr.Add($vm)
                 }
@@ -3860,14 +4231,33 @@ function Set-Fleet
 
         [Parameter(ParameterSetName = 'DataDisk')]
         [switch]
-        $Running
+        $Running,
+
+        [Parameter(ParameterSetName = 'SizeSpec')]
+        [Parameter(ParameterSetName = 'DataDisk')]
+        [Parameter(ParameterSetName = 'FullSpecDynamic')]
+        [switch]
+        $CreateArcVMs,
+
+        [Parameter(ParameterSetName = 'SizeSpec')]
+        [Parameter(ParameterSetName = 'DataDisk')]
+        [Parameter(ParameterSetName = 'FullSpecDynamic')]
+        [string]
+        $ResourceGroup
     )
 
     $nodes = @(Get-ClusterNode -Cluster $Cluster |? State -eq Up)
 
     # Fill parameters
     $p = @{}
-
+    if($CreateArcVMs){
+        if($ResourceGroup -eq $null){
+            LogOutput -ForegroundColor Red "Please specify resource group of vms."
+            return;
+        }
+        $p['CreateArcVMs'] = $true
+        $p['ResourceGroup'] =$ResourceGroup
+    }
     switch ($PSCmdlet.ParameterSetName) {
 
         'FullSpecDynamic'
@@ -3925,7 +4315,20 @@ function Set-Fleet
                 }
                 else
                 {
-                    $vm | Set-VM @p
+                    if($p['CreateArcVMs'] -eq $true){
+                        $name = $vm.Name
+                        $cpuCount = $p['ProcessorCount']
+                        $memorymb = $p['MemoryStartupBytes']/1048576
+                        $rg = $p['ResourceGroup']
+                        # for now, this script only supports static memory for Arc vms
+                        az stack-hci-vm update --name $name --v-cpus-available $cpuCount --memory-mb $memorymb --resource-group $rg
+                        # currently, vms go back to running state instead of original state before peforming an update
+                        az stack-hci-vm stop --name $name --resource-group $rg
+                    }
+                    else {
+                        $vm | Set-VM @p
+                    }
+
                     continue
                 }
             }
@@ -3987,7 +4390,14 @@ function Set-Fleet
 
                 function Create
                 {
-                    $path = Join-Path $vm.Path "data.vhdx"
+                    if($CreateArcVMs){
+                        $vmName = $vm.Name
+                        $dataDiskName = "data-$vmName.vhdx"
+                        $path = Join-Path $vm.Path $dataDiskName
+                    }
+                    else {
+                        $path = Join-Path $vm.Path "data.vhdx"
+                    }
 
                     if ($null -eq $path)
                     {
@@ -5050,6 +5460,45 @@ function Clear-FleetRunState
     Write-Output 0 > $goPath
 }
 
+function Create-TemplateRunScript
+{
+    [CmdletBinding()]
+    param(
+        [string]
+        $AddSpec = "",
+
+        [string]
+        $controlPath,
+
+        [string]
+        $RunFile = "sweep.ps1",
+
+        [string]
+        $RunProfileFile = "sweep.xml"
+    )
+
+     # Pause for SMB dir/info cache to expire and surface go flag.
+     # Runner will wait for new content - note unique guid.
+     Start-Sleep $smbInfoCacheLifetime
+
+    $vmprof = "L:\control\$RunProfileFile"
+    $guid = [System.Guid]::NewGuid().Guid
+
+    $f = Join-Path $controlPath $RunFile
+    $(Get-Command Set-RunProfileTemplateScript).ScriptBlock |% {
+
+        # apply subsitutions to produce a new run file
+        $line = $_
+        $line = $line -replace '__AddSpec__',$AddSpec
+        $line = $line -replace '__Profile__',$vmprof
+        $line = $line -replace '__Unique__',$guid
+        $line
+
+    } | Out-File "$($f).tmp" -Encoding ascii -Width ([int32]::MaxValue)
+    if (Test-Path $f) { Remove-Item $f -Force }
+    Rename-Item "$($f).tmp" $RunFile
+}
+
 function Start-FleetRun
 {
     [CmdletBinding()]
@@ -5212,26 +5661,7 @@ function Start-FleetRun
     # Create templated run script to inject this profile?
     if ($psCmdlet.ParameterSetName -ne "ByPrePlaced")
     {
-         # Pause for SMB dir/info cache to expire and surface go flag.
-         # Runner will wait for new content - note unique guid.
-         Start-Sleep $smbInfoCacheLifetime
-
-        $vmprof = "L:\control\$RunProfileFile"
-        $guid = [System.Guid]::NewGuid().Guid
-
-        $f = Join-Path $controlPath $RunFile
-        $(Get-Command Set-RunProfileTemplateScript).ScriptBlock |% {
-
-            # apply subsitutions to produce a new run file
-            $line = $_
-            $line = $line -replace '__AddSpec__',$AddSpec
-            $line = $line -replace '__Profile__',$vmprof
-            $line = $line -replace '__Unique__',$guid
-            $line
-
-        } | Out-File "$($f).tmp" -Encoding ascii -Width ([int32]::MaxValue)
-        if (Test-Path $f) { Remove-Item $f -Force }
-        Rename-Item "$($f).tmp" $RunFile
+         Create-TemplateRunScript $AddSpec $controlPath $RunFile $RunProfileFile
     }
 
     # capture time zero
@@ -6649,7 +7079,15 @@ function Measure-FleetCoreWorkload
 
         [Parameter()]
         [switch]
-        $UseStorageQos
+        $UseStorageQos,
+
+        [Parameter()]
+        [switch]
+        $CreateArcVMs,
+
+        [Parameter()]
+        [string]
+        $ResourceGroup
     )
 
     # Remoting parametersets
@@ -6731,7 +7169,13 @@ function Measure-FleetCoreWorkload
             $VMPercent = 100,
 
             [switch]
-            $KeyColumn
+            $KeyColumn,
+            
+            [switch]
+            $CreateArcVMs,
+
+            [string]
+            $ResourceGroup
         )
 
         if ($KeyColumn)
@@ -6743,20 +7187,26 @@ function Measure-FleetCoreWorkload
             $myKeyColumn.FleetVMPercent = $VMPercent
         }
         else
-        { Set-Fleet @clusterParam -ComputeTemplate $myKeyColumn.ComputeTemplate }
+        {Set-Fleet @clusterParam -ComputeTemplate $myKeyColumn.ComputeTemplate -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup }
     }
 
     function ApplyVMDataDisk
     {
         param(
             [switch]
-            $KeyColumn
+            $KeyColumn,
+
+            [switch]
+            $CreateArcVMs,
+
+            [string]
+            $ResourceGroup
+
         )
 
         if ($KeyColumn)
         {
             $dataDiskSize = Get-FleetDataDiskEstimate @clusterParam -CachePercent 200 -CapacityPercent 30 -VMPercent $myKeyColumn.FleetVMPercent -Verbose
-
             # Opt to use internal load file if disk size would be smaller.
             # This can happen in storage limited/compute rich builds.
             if ($dataDiskSize -le 10GB)
@@ -6767,8 +7217,7 @@ function Measure-FleetCoreWorkload
         }
         else
         {
-            $d = Set-Fleet -DataDiskSize $myKeyColumn.DataDiskBytes -Running
-
+            $d = Set-Fleet -DataDiskSize $myKeyColumn.DataDiskBytes -Running -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
             # If data disks were newly created, execute write warmup.
             if ($null -ne $d)
             {
@@ -6781,11 +7230,10 @@ function Measure-FleetCoreWorkload
     {
         if ($state.ContainsKey('startVM')) { return }
         $state.startVM = $true
-
         AlignVM
-        ApplyVMTemplate $myKeyColumn.ComputeTemplate $myKeyColumn.FleetVMPercent
-        Start-Fleet @clusterParam -Percent $myKeyColumn.FleetVMPercent
-        ApplyVMDataDisk
+        ApplyVMTemplate $myKeyColumn.ComputeTemplate $myKeyColumn.FleetVMPercent -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        Start-Fleet @clusterParam -Percent $myKeyColumn.FleetVMPercent -CreateArcVMs:$CreateArcVMs
+        ApplyVMDataDisk -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
     }
 
     function AlignVM
@@ -6905,9 +7353,8 @@ function Measure-FleetCoreWorkload
 
         $state = @{}
         Stop-Fleet @clusterParam
-        ApplyVMTemplate -KeyColumn A1v2 100
-        ApplyVMDataDisk -KeyColumn
-
+        ApplyVMTemplate -KeyColumn A1v2 100 -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        ApplyVMDataDisk -KeyColumn -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
         foreach ($alignment in 100,70)
         {
             $myKeyColumn.VMAlignmentPct = $alignment
@@ -6921,9 +7368,8 @@ function Measure-FleetCoreWorkload
 
         $state = @{}
         Stop-Fleet @clusterParam
-        ApplyVMTemplate -KeyColumn A4v2 25
-        ApplyVMDataDisk -KeyColumn
-
+        ApplyVMTemplate -KeyColumn A4v2 25 -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
+        ApplyVMDataDisk -KeyColumn -CreateArcVMs:$CreateArcVMs -ResourceGroup $ResourceGroup
         foreach ($alignment in 100,70)
         {
             $myKeyColumn.VMAlignmentPct = $alignment
@@ -7102,6 +7548,97 @@ function Test-FleetResultRun
 
     # If any - there may be a ? if we match multiple (incomplete keys?), but there may be utility there.
     return ($n -ne 0)
+}
+
+# Generates and sets up the run profile XML file for a given workload profile
+# Can be used for free runs
+function Set-FleetRunProfileScript
+{
+    param(
+        [string]
+        $Cluster = ".",
+
+        [Parameter(Mandatory=$true)] 
+        [xml]
+        $ProfileXml,
+
+        [switch]
+        $CpuSweep,
+
+        [switch]
+        $UseStorageQos,
+
+        [uint32]
+        $SearchWarmup = 0,
+
+        [string]
+        $RunFile = "sweep.ps1",
+
+        [string]
+        $RunProfileFile = "sweep.xml"
+        )
+
+        $clusterParam = @{}
+        CopyKeyIf $PSBoundParameters $clusterParam 'Cluster'
+
+        if ($CpuSweep -and -not (IsProfileSingleTimespan -ProfileXml $ProfileXml))
+        {
+            Write-Error "Profile for a CpuSweep can only contain a single timespan"
+            return
+        }
+
+        $QoS = 0 
+        $IsBaseline = $false
+        $IsSearch = $false
+        if (IsProfileThroughputLimited -ProfileXml $ProfileXml)
+        {
+            $addspec = "baseline"
+            if ($CpuSweep)
+            {
+                if(IsProfileSingleTarget -ProfileXml $ProfileXml -and $SearchWarmup)
+                {              
+                $ProfileXml = $ProfileXml | Set-FleetProfile -Warmup $SearchWarmup      
+                }
+            }
+        }
+        else
+        {
+            $addspec = "qos$qos"
+            if ($CpuSweep)
+            {
+                if ($UseStorageQos)
+                {
+                    Set-StorageQosPolicy -Name SweepQoS -MaximumIops $QoS @cimParam
+                }
+                else
+                {
+                    $ProfileXml = $ProfileXml | Set-FleetProfile -Throughput $QoS -ThroughputUnit IOPS
+                }
+            }
+        }
+
+        $accessNode = Get-AccessNode @clusterParam
+        $cimParam = @{ CimSession = $accessNode }
+
+        if ($VerbosePreference)
+        {
+            $ProfileXml | Convert-FleetXmlToString |% { LogOutput -IsVb $_ }
+        }
+
+        $Duration = GetProfileDuration -ProfileXml $ProfileXml -Total
+
+        if ($null -eq $Duration -or $Duration -eq 0)
+        {
+            Write-Error "Run duration could not be determined, cannot continue"
+            return
+        }
+
+        $controlPath = Get-FleetPath -PathType Control @clusterParam
+        $runProfileFilePath = Join-Path $controlPath $RunProfileFile
+        Remove-Item $runProfileFilePath -Force -ErrorAction SilentlyContinue
+        $ProfileXml | Convert-FleetXmlToString | Out-File $runProfileFilePath -Encoding ascii -Width ([int32]::MaxValue) -Force
+
+        Create-TemplateRunScript $addspec $controlPath $RunFile $RunProfileFile
 }
 
 function Start-FleetResultRun
