@@ -2731,12 +2731,12 @@ function New-Fleet
            LogOutput "Network Adapter attached to VM"
     }
     Stop-Fleet
-    Specialize-ArcVMs $admin $adminpass $connectuser $connectpass
+    Initialize-ArcVMs $admin $adminpass $connectuser $connectpass
     }
 }
 
-# specialize Arc VMs
-function Specialize-ArcVMs ($admin ,$adminpass, $connectuser, $connectpass){
+# Initialize Arc VMs
+function Initialize-ArcVMs ($admin ,$adminpass, $connectuser, $connectpass){
     $clusterName = (Get-Cluster).Name
     $nodes = @(Get-ClusterNode -Cluster $clusterName | ? State -eq Up)
     foreach ($vm in Get-VM -CimSession $nodes.Name | ? Name -like 'vm-*') {

@@ -140,7 +140,7 @@ FunctionsToExport = @(
     'Use-FleetPolynomialFit',
     'Watch-FleetCluster',
     'Watch-FleetCPU',
-    'Specialize-ArcVMs',
+    'Initialize-ArcVMs',
     'Remove-ArcVMFleet'
 )
 
